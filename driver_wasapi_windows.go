@@ -25,7 +25,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/ebitengine/oto/v3/internal/mux"
+	"github.com/marrasen/oto/v3/internal/mux"
 )
 
 type comThread struct {

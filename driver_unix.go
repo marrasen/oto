@@ -19,7 +19,7 @@ package oto
 import (
 	"fmt"
 
-	"github.com/ebitengine/oto/v3/internal/mux"
+	"github.com/marrasen/oto/v3/internal/mux"
 )
 
 // unixBackend is the part of a context that talks to the actual audio device.

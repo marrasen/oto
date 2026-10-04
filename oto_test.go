@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebitengine/oto/v3"
+	"github.com/marrasen/oto/v3"
 )
 
 var theContext *oto.Context

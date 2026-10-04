@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ebitengine/oto/v3/internal/mux"
-	"github.com/ebitengine/oto/v3/internal/oboe"
+	"github.com/marrasen/oto/v3/internal/mux"
+	"github.com/marrasen/oto/v3/internal/oboe"
 )
 
 type context struct {

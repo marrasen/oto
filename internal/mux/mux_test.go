@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebitengine/oto/v3/internal/mux"
+	"github.com/marrasen/oto/v3/internal/mux"
 )
 
 // newPlayer creates a player on m and closes it when the test finishes.
