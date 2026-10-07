@@ -72,7 +72,7 @@ type _AudioQueueBufferRef *_AudioQueueBuffer
 
 type _AudioQueueBuffer struct {
 	mAudioDataBytesCapacity uint32
-	mAudioData              uintptr // void*
+	mAudioData              unsafe.Pointer // void*
 	mAudioDataByteSize      uint32
 	mUserData               uintptr // void*
 

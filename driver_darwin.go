@@ -289,7 +289,7 @@ func (c *context) step(buf32 []float32) {
 	c.unqueuedBuffers = c.unqueuedBuffers[:len(c.unqueuedBuffers)-1]
 
 	c.mux.ReadFloat32s(buf32)
-	copy(unsafe.Slice((*float32)(unsafe.Pointer(buf.mAudioData)), buf.mAudioDataByteSize/float32SizeInBytes), buf32)
+	copy(unsafe.Slice((*float32)(buf.mAudioData), buf.mAudioDataByteSize/float32SizeInBytes), buf32)
 
 	if osstatus := _AudioQueueEnqueueBuffer(c.audioQueue, buf, 0, nil); osstatus != noErr {
 		if osstatus == kAudioQueueErr_QueueInvalidated {
