@@ -23,6 +23,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +58,13 @@ type Mux struct {
 	playersMu sync.Mutex
 	players   map[*playerImpl]struct{}
 	cond      *sync.Cond
+
+	// closed is set by Close, under playersMu so that no player is added after
+	// it. Close signals cond after setting it, so that loop does not miss it.
+	closed atomic.Bool
+
+	// loopDone is closed when loop returns.
+	loopDone chan struct{}
 }
 
 // New creates a new Mux.
@@ -66,9 +74,32 @@ func New(sampleRate int, channelCount int, format Format) *Mux {
 		channelCount: channelCount,
 		format:       format,
 		cond:         sync.NewCond(&sync.Mutex{}),
+		loopDone:     make(chan struct{}),
 	}
 	go m.loop()
 	return m
+}
+
+// Close stops the mux. Its players stop reading their sources and are closed,
+// and the goroutine reading them ends. A player of a closed mux does nothing
+// when it is played. ReadFloat32s still works, and returns silence.
+//
+// Close blocks until an ongoing read from a source finishes, if any. After
+// Close returns, no source is read again.
+//
+// Calling Close more than once is harmless.
+func (m *Mux) Close() {
+	m.playersMu.Lock()
+	m.closed.Store(true)
+	m.playersMu.Unlock()
+
+	m.signal()
+
+	<-m.loopDone
+
+	for _, p := range m.appendPlayers(nil) {
+		_ = p.Close()
+	}
 }
 
 func (m *Mux) shouldWait(players []*playerImpl) bool {
@@ -80,27 +111,41 @@ func (m *Mux) shouldWait(players []*playerImpl) bool {
 	return true
 }
 
-func (m *Mux) wait(players []*playerImpl) []*playerImpl {
+// wait returns the players to read from, once one of them can read. It returns
+// false when the mux is closed.
+func (m *Mux) wait(players []*playerImpl) ([]*playerImpl, bool) {
 	m.cond.L.Lock()
 	defer m.cond.L.Unlock()
 
 	for {
+		if m.closed.Load() {
+			return players, false
+		}
 		clear(players)
 		players = m.appendPlayers(players[:0])
 		if !m.shouldWait(players) {
-			return players
+			return players, true
 		}
 		m.cond.Wait()
 	}
 }
 
 func (m *Mux) loop() {
+	defer close(m.loopDone)
+
 	var players []*playerImpl
 	for {
-		players = m.wait(players)
+		var ok bool
+		players, ok = m.wait(players)
+		if !ok {
+			return
+		}
 
 		allZero := true
 		for _, p := range players {
+			if m.closed.Load() {
+				break
+			}
 			n := p.readSourceToBuffer()
 			if n != 0 {
 				allZero = false
@@ -125,14 +170,20 @@ func (m *Mux) appendPlayers(players []*playerImpl) []*playerImpl {
 	return players
 }
 
-func (m *Mux) addPlayer(player *playerImpl) {
+// addPlayer registers player, and reports whether it did. It does not once the
+// mux is closed.
+func (m *Mux) addPlayer(player *playerImpl) bool {
 	m.playersMu.Lock()
 	defer m.playersMu.Unlock()
 
+	if m.closed.Load() {
+		return false
+	}
 	if m.players == nil {
 		m.players = map[*playerImpl]struct{}{}
 	}
 	m.players[player] = struct{}{}
+	return true
 }
 
 func (m *Mux) removePlayer(player *playerImpl) {
@@ -298,9 +349,10 @@ func (p *playerImpl) playImpl() {
 	if p.eof && len(p.buf) == 0 {
 		return
 	}
+	if !p.mux.addPlayer(p) {
+		return
+	}
 	p.state = playerPlay
-
-	p.mux.addPlayer(p)
 }
 
 func (p *Player) Pause() {
