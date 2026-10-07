@@ -72,3 +72,7 @@ func (c *context) Resume() error {
 func (c *context) Err() error {
 	return nil
 }
+
+func (c *context) Close() error {
+	return ErrCloseUnsupported
+}

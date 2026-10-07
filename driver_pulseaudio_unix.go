@@ -32,6 +32,7 @@ type pulseContext struct {
 	stream *pulse.PlaybackStream
 
 	suspended bool
+	closed    bool
 	cond      *sync.Cond
 
 	mux *mux.Mux
@@ -102,15 +103,22 @@ func (c *pulseContext) read(buf []float32) (int, error) {
 	return len(buf), nil
 }
 
-// waitUntilResumed blocks while the context is suspended.
+// waitUntilResumed blocks while the context is suspended. Once the context is
+// closed, it returns pulse.EndOfData, which stops the stream without an error.
 func (c *pulseContext) waitUntilResumed() error {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	for c.suspended && c.err.Load() == nil {
+	for c.suspended && !c.closed && c.err.Load() == nil {
 		c.cond.Wait()
 	}
-	return c.err.Load()
+	if err := c.err.Load(); err != nil {
+		return err
+	}
+	if c.closed {
+		return pulse.EndOfData
+	}
+	return nil
 }
 
 // setSuspended updates the suspended state and wakes up a waiting reader.
@@ -139,6 +147,19 @@ func (c *pulseContext) Suspend() error {
 
 func (c *pulseContext) Resume() error {
 	return c.setSuspended(false)
+}
+
+// Close stops the stream, and closes the connection to the server.
+func (c *pulseContext) Close() error {
+	c.cond.L.Lock()
+	c.closed = true
+	c.cond.Broadcast()
+	c.cond.L.Unlock()
+
+	// The stream reads no more: read returns pulse.EndOfData from now on.
+	c.stream.Close()
+	c.client.Close()
+	return nil
 }
 
 func (c *pulseContext) Err() error {

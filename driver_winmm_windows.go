@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -78,9 +79,16 @@ type winmmContext struct {
 
 	buf32 []float32
 
-	mux       *mux.Mux
-	err       atomicError
-	loopEndCh chan error
+	mux *mux.Mux
+	err atomicError
+
+	// closing is set by Close. loop ends, and closeLoop closes the device.
+	closing atomic.Bool
+
+	// loopDone is closed when loop returns. closeErr is the error of closing
+	// the device, if Close closed it.
+	loopDone chan struct{}
+	closeErr error
 
 	cond *sync.Cond
 
@@ -103,6 +111,7 @@ func newWinMMContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInByt
 		mux:               mux,
 		cond:              sync.NewCond(&sync.Mutex{}),
 		suspendedCond:     sync.NewCond(&sync.Mutex{}),
+		loopDone:          make(chan struct{}),
 	}
 	theWinMMContext = c
 
@@ -184,6 +193,22 @@ func (c *winmmContext) Resume() (ferr error) {
 	return nil
 }
 
+// Close ends loop, which closes the device.
+func (c *winmmContext) Close() error {
+	c.closing.Store(true)
+
+	c.suspendedCond.L.Lock()
+	c.suspendedCond.Broadcast()
+	c.suspendedCond.L.Unlock()
+
+	c.cond.L.Lock()
+	c.cond.Broadcast()
+	c.cond.L.Unlock()
+
+	<-c.loopDone
+	return c.closeErr
+}
+
 func (c *winmmContext) Err() error {
 	if err := c.err.Load(); err != nil {
 		return err.(error)
@@ -215,21 +240,26 @@ func (c *winmmContext) waitUntilHeaderAvailable() bool {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	for !c.isHeaderAvailable() && c.err.Load() == nil && c.loopEndCh == nil {
+	for !c.isHeaderAvailable() && c.err.Load() == nil && !c.closing.Load() {
 		c.cond.Wait()
 	}
-	return c.err.Load() == nil && c.loopEndCh == nil
+	return c.err.Load() == nil && !c.closing.Load()
 }
 
 func (c *winmmContext) loop() {
+	defer close(c.loopDone)
 	defer func() {
 		if err := c.closeLoop(); err != nil {
+			if c.closing.Load() {
+				c.closeErr = err
+				return
+			}
 			c.err.Join(err)
 		}
 	}()
 	for {
 		c.suspendedCond.L.Lock()
-		for c.suspended {
+		for c.suspended && !c.closing.Load() {
 			c.suspendedCond.Wait()
 		}
 		c.suspendedCond.L.Unlock()
@@ -241,40 +271,33 @@ func (c *winmmContext) loop() {
 	}
 }
 
-func (c *winmmContext) closeLoop() (ferr error) {
+func (c *winmmContext) closeLoop() error {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	defer func() {
-		if c.loopEndCh != nil {
-			if ferr != nil {
-				c.loopEndCh <- ferr
-				ferr = nil
-			}
-			close(c.loopEndCh)
-			c.loopEndCh = nil
-		}
-	}()
+	// Take the queued headers back from the device, as a queued header cannot be
+	// unprepared. Closing goes on if this fails.
+	resetErr := waveOutReset(c.waveOut)
 
 	for _, h := range c.headers {
 		if err := h.Close(); err != nil {
-			return err
+			return errors.Join(resetErr, err)
 		}
 	}
 	c.headers = nil
 
 	if err := waveOutClose(c.waveOut); err != nil {
-		return err
+		return errors.Join(resetErr, err)
 	}
 	c.waveOut = 0
-	return nil
+	return resetErr
 }
 
 func (c *winmmContext) appendBuffers() {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	if c.err.Load() != nil {
+	if c.err.Load() != nil || c.closing.Load() {
 		return
 	}
 

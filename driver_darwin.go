@@ -125,6 +125,13 @@ type context struct {
 	// stopped and cleared when the deferral is ended by another path (endDeferStart).
 	startRetryTimer *time.Timer
 
+	// closed indicates that Close was called. loop ends, and Close disposes the
+	// AudioQueue.
+	closed bool
+
+	// loopDone is closed when the goroutine running loop ends.
+	loopDone chan struct{}
+
 	mux *mux.Mux
 	err atomicError
 }
@@ -159,6 +166,7 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		sampleRate:           sampleRate,
 		channelCount:         channelCount,
 		oneBufferSizeInBytes: oneBufferSizeInBytes,
+		loopDone:             make(chan struct{}),
 	}
 	theContext = c
 
@@ -167,6 +175,8 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 	}
 
 	go func() {
+		defer close(c.loopDone)
+
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
@@ -206,10 +216,10 @@ func (c *context) wait() bool {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	for c.idle() && c.err.Load() == nil {
+	for c.idle() && !c.closed && c.err.Load() == nil {
 		c.cond.Wait()
 	}
-	return c.err.Load() == nil
+	return !c.closed && c.err.Load() == nil
 }
 
 // idle reports whether step has nothing to do for now: the actual queue state matches
@@ -247,7 +257,7 @@ func (c *context) step(buf32 []float32) {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	if c.err.Load() != nil {
+	if c.closed || c.err.Load() != nil {
 		return
 	}
 
@@ -483,6 +493,34 @@ func (c *context) rebuildAudioQueue() error {
 
 func (c *context) Err() error {
 	return c.err.Load()
+}
+
+// Close ends loop, and then disposes the AudioQueue, which frees its buffers.
+func (c *context) Close() error {
+	c.cond.L.Lock()
+	c.closed = true
+	c.endDeferStart()
+	c.cond.Signal()
+	c.cond.L.Unlock()
+
+	<-c.loopDone
+
+	// The queue is disposed without holding the lock, as its callback, render,
+	// takes the lock. render drops the buffers of a queue that is not
+	// c.audioQueue.
+	c.cond.L.Lock()
+	q := c.audioQueue
+	c.audioQueue = 0
+	c.unqueuedBuffers = nil
+	c.cond.L.Unlock()
+
+	if q == 0 {
+		return nil
+	}
+	if osstatus := _AudioQueueDispose(q, true); osstatus != noErr && osstatus != kAudioQueueErr_QueueInvalidated {
+		return fmt.Errorf("oto: AudioQueueDispose failed: %d", osstatus)
+	}
+	return nil
 }
 
 func render(inUserData unsafe.Pointer, inAQ _AudioQueueRef, inBuffer _AudioQueueBufferRef) {

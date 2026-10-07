@@ -68,9 +68,10 @@ func init() {
 	}
 }
 
-// loadALSA loads libasound and binds the functions above. A context is created at most once
-// per process (see NewContext), so this runs at most once and needs no synchronization.
-func loadALSA() error {
+// loadALSA loads libasound and binds the functions above, once per process.
+var loadALSA = sync.OnceValue(loadALSAOnce)
+
+func loadALSAOnce() error {
 	var handle uintptr
 	var err error
 	for _, name := range []string{"libasound.so.2", "libasound.so"} {
@@ -113,10 +114,14 @@ type alsaContext struct {
 	channelCount int
 
 	suspended bool
+	closed    bool
 
 	handle uintptr
 
 	cond *sync.Cond
+
+	// loopDone is closed when the goroutine writing to the device ends.
+	loopDone chan struct{}
 
 	mux *mux.Mux
 	err atomicError
@@ -133,6 +138,7 @@ func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSi
 	c := &alsaContext{
 		channelCount: channelCount,
 		cond:         sync.NewCond(&sync.Mutex{}),
+		loopDone:     make(chan struct{}),
 		mux:          mux,
 	}
 
@@ -153,8 +159,9 @@ func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSi
 	}
 
 	go func() {
-		// The loop only returns when readAndWrite hits a permanent error, so close the
-		// handle here to avoid leaking it after a terminal audio failure.
+		defer close(c.loopDone)
+		// The loop returns when readAndWrite hits a permanent error or the context is
+		// closed, so close the handle here to avoid leaking it.
 		defer _snd_pcm_close(c.handle)
 		buf32 := make([]float32, int(periodSize)*channelCount)
 		for {
@@ -232,10 +239,10 @@ func (c *alsaContext) readAndWrite(buf32 []float32) bool {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
-	for c.suspended && c.err.Load() == nil {
+	for c.suspended && !c.closed && c.err.Load() == nil {
 		c.cond.Wait()
 	}
-	if c.err.Load() != nil {
+	if c.closed || c.err.Load() != nil {
 		return false
 	}
 
@@ -281,6 +288,17 @@ func (c *alsaContext) Resume() error {
 
 	c.suspended = false
 	c.cond.Signal()
+	return nil
+}
+
+// Close ends the goroutine writing to the device, which closes the device.
+func (c *alsaContext) Close() error {
+	c.cond.L.Lock()
+	c.closed = true
+	c.cond.Signal()
+	c.cond.L.Unlock()
+
+	<-c.loopDone
 	return nil
 }
 

@@ -215,6 +215,10 @@ func (c *context) Err() error {
 	return nil
 }
 
+func (c *context) Close() error {
+	return ErrCloseUnsupported
+}
+
 func float32SliceToTypedArray(s []float32) js.Value {
 	bs := unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*4)
 	a := js.Global().Get("Uint8Array").New(len(bs))

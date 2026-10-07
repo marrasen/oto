@@ -27,6 +27,7 @@ type unixBackend interface {
 	Suspend() error
 	Resume() error
 	Err() error
+	Close() error
 }
 
 // newALSAContext creates the ALSA fallback backend. driver_alsa_unix.go's init sets it on the
@@ -88,6 +89,14 @@ func (c *context) Resume() error {
 	<-c.ready
 	if c.backend != nil {
 		return c.backend.Resume()
+	}
+	return nil
+}
+
+func (c *context) Close() error {
+	<-c.ready
+	if c.backend != nil {
+		return c.backend.Close()
 	}
 	return nil
 }

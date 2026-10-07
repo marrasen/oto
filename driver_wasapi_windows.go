@@ -111,6 +111,15 @@ type wasapiContext struct {
 	suspended     bool
 	suspendedCond *sync.Cond
 
+	// closed indicates that Close was called. It is guarded by suspendedCond.L.
+	closed bool
+
+	// runDone is closed when run returns.
+	runDone chan struct{}
+
+	// sampleReadyEventM guards closing sampleReadyEvent against Close setting it.
+	sampleReadyEventM sync.Mutex
+
 	sampleReadyEvent windows.Handle
 	client           *_IAudioClient2
 	bufferFrames     uint32
@@ -125,6 +134,7 @@ type wasapiContext struct {
 }
 
 var (
+	errClosed             = errors.New("oto: context closed")
 	errDeviceSwitched     = errors.New("oto: device switched")
 	errFormatNotSupported = errors.New("oto: the specified format is not supported (there is the closest format instead)")
 )
@@ -157,6 +167,7 @@ func newWASAPIContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInBy
 		bufferSizeInBytes: bufferSizeInBytes,
 		comThread:         t,
 		suspendedCond:     sync.NewCond(&sync.Mutex{}),
+		runDone:           make(chan struct{}),
 	}
 
 	defer func() {
@@ -226,6 +237,8 @@ func (c *wasapiContext) initialize() error {
 }
 
 func (c *wasapiContext) run() {
+	defer close(c.runDone)
+
 	// This goroutine owns the resources across all recovery attempts. The render
 	// loop has returned before cleanup can close the event or release interfaces.
 	defer c.close()
@@ -234,6 +247,10 @@ func (c *wasapiContext) run() {
 		err := c.loop()
 		c.comThread.Run(c.releaseOnCOMThread)
 		if err == nil {
+			return
+		}
+		// An error caused by closing is not reported.
+		if c.isClosed() {
 			return
 		}
 		// E_OUTOFMEMORY from IAudioRenderClient::GetBuffer has been observed on Xbox.
@@ -251,7 +268,9 @@ func (c *wasapiContext) run() {
 		}
 
 		if err := c.restart(); err != nil {
-			c.err.Join(err)
+			if !c.isClosed() {
+				c.err.Join(err)
+			}
 			return
 		}
 	}
@@ -260,10 +279,12 @@ func (c *wasapiContext) run() {
 // close must be called outside the COM thread after rendering has ended.
 func (c *wasapiContext) close() {
 	c.comThread.Run(c.releaseOnCOMThread)
+	c.sampleReadyEventM.Lock()
 	if c.sampleReadyEvent != 0 {
 		windows.CloseHandle(c.sampleReadyEvent)
 		c.sampleReadyEvent = 0
 	}
+	c.sampleReadyEventM.Unlock()
 	c.comThread.Stop()
 }
 
@@ -425,10 +446,14 @@ func (c *wasapiContext) loopOnRenderThread() error {
 	last := time.Now()
 	for {
 		c.suspendedCond.L.Lock()
-		for c.suspended {
+		for c.suspended && !c.closed {
 			c.suspendedCond.Wait()
 		}
+		closed := c.closed
 		c.suspendedCond.L.Unlock()
+		if closed {
+			return nil
+		}
 
 		evt, err := windows.WaitForSingleObject(c.sampleReadyEvent, windows.INFINITE)
 		if err != nil {
@@ -436,6 +461,11 @@ func (c *wasapiContext) loopOnRenderThread() error {
 		}
 		if evt != windows.WAIT_OBJECT_0 {
 			return fmt.Errorf("oto: WaitForSingleObject failed: returned value: %d", evt)
+		}
+
+		// Close sets the event to wake this loop up.
+		if c.isClosed() {
+			return nil
 		}
 
 		if err := c.writeOnRenderThread(); err != nil {
@@ -518,6 +548,31 @@ func (c *wasapiContext) Resume() error {
 	return nil
 }
 
+// Close ends the render loop, which releases the device and ends the COM thread.
+func (c *wasapiContext) Close() error {
+	c.suspendedCond.L.Lock()
+	c.closed = true
+	c.suspendedCond.L.Unlock()
+	c.suspendedCond.Broadcast()
+
+	// Wake the render loop up if it waits for the device. The event is closed
+	// only when run ends.
+	c.sampleReadyEventM.Lock()
+	if c.sampleReadyEvent != 0 {
+		_ = windows.SetEvent(c.sampleReadyEvent)
+	}
+	c.sampleReadyEventM.Unlock()
+
+	<-c.runDone
+	return nil
+}
+
+func (c *wasapiContext) isClosed() bool {
+	c.suspendedCond.L.Lock()
+	defer c.suspendedCond.L.Unlock()
+	return c.closed
+}
+
 func (c *wasapiContext) isSuspended() bool {
 	c.suspendedCond.L.Lock()
 	defer c.suspendedCond.L.Unlock()
@@ -560,11 +615,15 @@ func (c *wasapiContext) restart() error {
 		// immediately.
 		c.suspendedCond.L.Lock()
 		var wasSuspended bool
-		for c.suspended {
+		for c.suspended && !c.closed {
 			wasSuspended = true
 			c.suspendedCond.Wait()
 		}
+		closed := c.closed
 		c.suspendedCond.L.Unlock()
+		if closed {
+			return errClosed
+		}
 		if wasSuspended {
 			reacquireInterval = wasapiReacquireMinInterval
 			nextReacquire = time.Time{}

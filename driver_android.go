@@ -77,3 +77,7 @@ func (c *context) outputLatency() (time.Duration, bool) {
 func (c *context) Err() error {
 	return c.err.Load()
 }
+
+func (c *context) Close() error {
+	return ErrCloseUnsupported
+}

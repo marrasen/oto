@@ -30,6 +30,7 @@ var (
 	procWaveOutOpen            = winmm.NewProc("waveOutOpen")
 	procWaveOutClose           = winmm.NewProc("waveOutClose")
 	procWaveOutPrepareHeader   = winmm.NewProc("waveOutPrepareHeader")
+	procWaveOutReset           = winmm.NewProc("waveOutReset")
 	procWaveOutUnprepareHeader = winmm.NewProc("waveOutUnprepareHeader")
 	procWaveOutWrite           = winmm.NewProc("waveOutWrite")
 )
@@ -133,6 +134,17 @@ func waveOutClose(hwo uintptr) error {
 			return fmt.Errorf("oto: waveOutClose failed: %w", e)
 		}
 		return fmt.Errorf("oto: waveOutClose failed: %w", _MMRESULT(r))
+	}
+	return nil
+}
+
+func waveOutReset(hwo uintptr) error {
+	r, _, e := procWaveOutReset.Call(hwo)
+	if _MMRESULT(r) != _MMSYSERR_NOERROR {
+		if e != nil && e != windows.ERROR_SUCCESS {
+			return fmt.Errorf("oto: waveOutReset failed: %w", e)
+		}
+		return fmt.Errorf("oto: waveOutReset failed: %w", _MMRESULT(r))
 	}
 	return nil
 }

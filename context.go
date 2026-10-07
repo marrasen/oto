@@ -29,14 +29,25 @@ var (
 	contextCreationMutex sync.Mutex
 )
 
+// ErrCloseUnsupported is returned by Context.Close on the platforms where a
+// context cannot be closed yet: Android, browsers, Nintendo SDK and
+// PlayStation 5. The context stays usable.
+var ErrCloseUnsupported = errors.New("oto: closing a context is not supported on this platform")
+
 // Context is the main object in Oto. It interacts with the audio drivers.
 //
 // To play sound with Oto, first create a context. Then use the context to create
 // an arbitrary number of players. Then use the players to play sound.
 //
-// Creating multiple contexts is NOT supported.
+// Only one context can exist at a time. To create another, for example with
+// another sample rate, close the first with Close.
 type Context struct {
 	context *context
+
+	// closeMu is held by Close, and read-held by the functions that use the
+	// driver, so that the driver is not used while it is being closed.
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 // Format is the format of sources.
@@ -85,7 +96,8 @@ type NewContextOptions struct {
 // NewContext returns a context, a channel that closes when initialization finishes, and an error if it exists.
 // After the channel closes, call Context.Err to check whether initialization succeeded.
 //
-// Creating multiple contexts is NOT supported.
+// Only one context can exist at a time: NewContext returns an error while
+// another context is open. Close the open context first to create another.
 func NewContext(options *NewContextOptions) (*Context, chan struct{}, error) {
 	contextCreationMutex.Lock()
 	defer contextCreationMutex.Unlock()
@@ -152,25 +164,80 @@ func (c *Context) NewPlayer(r io.Reader) *Player {
 
 // Suspend suspends the entire audio play.
 //
+// Suspend does nothing after Close.
+//
 // Suspend is concurrent-safe.
 func (c *Context) Suspend() error {
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+
+	if c.closed {
+		return nil
+	}
 	return c.context.Suspend()
 }
 
 // Resume resumes the entire audio play, which was suspended by Suspend.
 //
+// Resume does nothing after Close.
+//
 // Resume is concurrent-safe.
 func (c *Context) Resume() error {
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+
+	if c.closed {
+		return nil
+	}
 	return c.context.Resume()
 }
 
 // Err returns an error that occurred in the audio driver, if any.
 // Errors reported by Err are fatal: once Err returns a non-nil error,
-// this context is no longer usable.
+// this context is no longer usable. Close it to create another.
 //
 // Err is concurrent-safe.
 func (c *Context) Err() error {
 	return c.context.Err()
+}
+
+// Close closes the context. It stops the audio driver, and releases the audio
+// device and the goroutines and threads the context uses. The context's players
+// stop playing and reading their sources. Calls on them after Close are safe,
+// and do nothing; so are calls on the context.
+//
+// Close waits for a read from a player's source in flight, if any, so no source
+// is read after Close returns. Close must not be called from a source's Read.
+//
+// After Close returns, NewContext can be called again, for example with another
+// sample rate or buffer size.
+//
+// On the platforms where a context cannot be closed yet, Close returns
+// ErrCloseUnsupported and the context stays usable. On the other platforms the
+// context is closed even if Close returns an error. Calling Close again returns
+// nil.
+//
+// Close is concurrent-safe.
+func (c *Context) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+
+	if c.closed {
+		return nil
+	}
+
+	err := c.context.Close()
+	if errors.Is(err, ErrCloseUnsupported) {
+		return err
+	}
+	c.closed = true
+	c.context.mux.Close()
+
+	contextCreationMutex.Lock()
+	defer contextCreationMutex.Unlock()
+	contextCreated = false
+
+	return err
 }
 
 type atomicError struct {
