@@ -28,6 +28,7 @@ type unixBackend interface {
 	Resume() error
 	Err() error
 	Close() error
+	DeviceSampleRate() (int, bool)
 }
 
 // newALSAContext creates the ALSA fallback backend. driver_alsa_unix.go's init sets it on the
@@ -91,6 +92,18 @@ func (c *context) Resume() error {
 		return c.backend.Resume()
 	}
 	return nil
+}
+
+func (c *context) DeviceSampleRate() (int, bool) {
+	select {
+	case <-c.ready:
+	default:
+		return 0, false
+	}
+	if c.backend != nil {
+		return c.backend.DeviceSampleRate()
+	}
+	return 0, false
 }
 
 func (c *context) Close() error {

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -113,6 +114,10 @@ type wasapiContext struct {
 
 	// closed indicates that Close was called. It is guarded by suspendedCond.L.
 	closed bool
+
+	// deviceSampleRate is the sample rate of the device's mix format, or 0 if
+	// it is not known.
+	deviceSampleRate atomic.Uint32
 
 	// runDone is closed when run returns.
 	runDone chan struct{}
@@ -345,6 +350,14 @@ func (c *wasapiContext) startOnCOMThread() (ferr error) {
 	}
 	c.client = (*_IAudioClient2)(client)
 
+	// With AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM below, Windows converts the sound
+	// to the mix format's sample rate. The rate is only reported.
+	if f, err := c.client.GetMixFormat(); err == nil {
+		c.deviceSampleRate.Store(f.nSamplesPerSec)
+	} else {
+		c.deviceSampleRate.Store(0)
+	}
+
 	if err := c.client.SetClientProperties(&_AudioClientProperties{
 		cbSize:     uint32(unsafe.Sizeof(_AudioClientProperties{})),
 		bIsOffload: 0,                    // false
@@ -565,6 +578,11 @@ func (c *wasapiContext) Close() error {
 
 	<-c.runDone
 	return nil
+}
+
+func (c *wasapiContext) DeviceSampleRate() (int, bool) {
+	r := c.deviceSampleRate.Load()
+	return int(r), r > 0
 }
 
 func (c *wasapiContext) isClosed() bool {

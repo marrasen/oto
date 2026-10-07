@@ -277,6 +277,23 @@ func (i *_IAudioClient2) GetDevicePeriod() (_REFERENCE_TIME, _REFERENCE_TIME, er
 	return defaultDevicePeriod, minimumDevicePeriod, nil
 }
 
+// GetMixFormat returns the header of the mix format the audio engine uses for
+// shared-mode streams.
+func (i *_IAudioClient2) GetMixFormat() (*_WAVEFORMATEX, error) {
+	var f *_WAVEFORMATEX
+	r, _, _ := syscall.SyscallN(i.vtbl.GetMixFormat, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(&f)))
+	if uint32(r) != uint32(windows.S_OK) {
+		if isAudclntErr(uint32(r)) {
+			return nil, fmt.Errorf("oto: IAudioClient2::GetMixFormat failed: %w", _AUDCLNT_ERR(r))
+		}
+		return nil, fmt.Errorf("oto: IAudioClient2::GetMixFormat failed: HRESULT(%d)", uint32(r))
+	}
+	// The format is allocated by the audio engine. Copy its header, and free it.
+	ret := *f
+	windows.CoTaskMemFree(unsafe.Pointer(f))
+	return &ret, nil
+}
+
 func (i *_IAudioClient2) GetService(riid *windows.GUID) (unsafe.Pointer, error) {
 	var v unsafe.Pointer
 	r, _, _ := syscall.Syscall(i.vtbl.GetService, 3, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(riid)), uintptr(unsafe.Pointer(&v)))

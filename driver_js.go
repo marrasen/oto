@@ -219,6 +219,10 @@ func (c *context) Close() error {
 	return ErrCloseUnsupported
 }
 
+func (c *context) DeviceSampleRate() (int, bool) {
+	return 0, false
+}
+
 func float32SliceToTypedArray(s []float32) js.Value {
 	bs := unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*4)
 	a := js.Global().Get("Uint8Array").New(len(bs))

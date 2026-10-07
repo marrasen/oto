@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/jfreymuth/pulse"
+	"github.com/jfreymuth/pulse/proto"
 
 	"github.com/marrasen/oto/v3/internal/mux"
 )
@@ -147,6 +148,24 @@ func (c *pulseContext) Suspend() error {
 
 func (c *pulseContext) Resume() error {
 	return c.setSuspended(false)
+}
+
+// DeviceSampleRate asks the server for the sample rate of the sink the stream
+// plays to. The server can move the stream to another sink at any time, for
+// example when the default sink changes.
+func (c *pulseContext) DeviceSampleRate() (int, bool) {
+	var input proto.GetSinkInputInfoReply
+	if err := c.client.RawRequest(&proto.GetSinkInputInfo{SinkInputIndex: c.stream.StreamInputIndex()}, &input); err != nil {
+		return 0, false
+	}
+	var sink proto.GetSinkInfoReply
+	if err := c.client.RawRequest(&proto.GetSinkInfo{SinkIndex: input.SinkIndex}, &sink); err != nil {
+		return 0, false
+	}
+	if sink.Rate == 0 {
+		return 0, false
+	}
+	return int(sink.Rate), true
 }
 
 // Close stops the stream, and closes the connection to the server.

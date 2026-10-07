@@ -113,6 +113,9 @@ func loadALSAOnce() error {
 type alsaContext struct {
 	channelCount int
 
+	// deviceSampleRate is the sample rate ALSA set up for the device.
+	deviceSampleRate int
+
 	suspended bool
 	closed    bool
 
@@ -232,6 +235,7 @@ func (c *alsaContext) alsaPCMHwParams(sampleRate, channelCount int, bufferSize, 
 	if err := _snd_pcm_hw_params(c.handle, params); err < 0 {
 		return alsaError("snd_pcm_hw_params", err)
 	}
+	c.deviceSampleRate = int(sr)
 	return nil
 }
 
@@ -289,6 +293,10 @@ func (c *alsaContext) Resume() error {
 	c.suspended = false
 	c.cond.Signal()
 	return nil
+}
+
+func (c *alsaContext) DeviceSampleRate() (int, bool) {
+	return c.deviceSampleRate, c.deviceSampleRate > 0
 }
 
 // Close ends the goroutine writing to the device, which closes the device.

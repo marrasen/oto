@@ -43,6 +43,10 @@ const (
 )
 
 const (
+	kAudioQueueDeviceProperty_SampleRate = 0x61717372 // 'aqsr'
+)
+
+const (
 	kAudioFormatFlagIsFloat = 1 << 0 // 0x1
 )
 
@@ -94,6 +98,7 @@ func initializeAPI() error {
 	purego.RegisterLibFunc(&_AudioQueueStart, toolbox, "AudioQueueStart")
 	purego.RegisterLibFunc(&_AudioQueuePause, toolbox, "AudioQueuePause")
 	purego.RegisterLibFunc(&_AudioQueueDispose, toolbox, "AudioQueueDispose")
+	purego.RegisterLibFunc(&_AudioQueueGetProperty, toolbox, "AudioQueueGetProperty")
 
 	initializeSessionAPI()
 
@@ -111,3 +116,5 @@ var _AudioQueueStart func(inAQ _AudioQueueRef, inStartTime *_AudioTimeStamp) uin
 var _AudioQueuePause func(inAQ _AudioQueueRef) uintptr
 
 var _AudioQueueDispose func(inAQ _AudioQueueRef, inImmediate bool) uintptr
+
+var _AudioQueueGetProperty func(inAQ _AudioQueueRef, inID uint32, outData unsafe.Pointer, ioDataSize *uint32) uintptr

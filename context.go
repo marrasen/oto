@@ -201,6 +201,36 @@ func (c *Context) Err() error {
 	return c.context.Err()
 }
 
+// DeviceSampleRate returns the sample rate the audio device runs at, and whether
+// the driver knows it. When it differs from the sample rate of the context, the
+// system converts the sound to the device's rate before the device plays it.
+//
+// What it reports depends on the driver:
+//
+//   - WASAPI (Windows): the sample rate of the device's shared mix format.
+//     Windows converts the sound to it.
+//   - PulseAudio (Linux and BSD): the sample rate of the sink the sound plays
+//     to. The sound server converts the sound to it. DeviceSampleRate asks the
+//     server each time it is called.
+//   - ALSA (Linux and BSD): the sample rate ALSA set up for the device oto
+//     opened. A plugin device, such as the default one, can convert the sound
+//     again, to a rate that is not reported.
+//   - AudioQueue (macOS and iOS): the sample rate of the output device.
+//
+// The other drivers do not report it. DeviceSampleRate returns 0 and false
+// when the rate is not known, before the context is ready, and after Close.
+//
+// DeviceSampleRate is concurrent-safe.
+func (c *Context) DeviceSampleRate() (int, bool) {
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+
+	if c.closed {
+		return 0, false
+	}
+	return c.context.DeviceSampleRate()
+}
+
 // Close closes the context. It stops the audio driver, and releases the audio
 // device and the goroutines and threads the context uses. The context's players
 // stop playing and reading their sources. Calls on them after Close are safe,

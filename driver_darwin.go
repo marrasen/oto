@@ -16,6 +16,7 @@ package oto
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -493,6 +494,25 @@ func (c *context) rebuildAudioQueue() error {
 
 func (c *context) Err() error {
 	return c.err.Load()
+}
+
+// DeviceSampleRate asks the AudioQueue for the sample rate of its output device.
+func (c *context) DeviceSampleRate() (int, bool) {
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+
+	if c.audioQueue == 0 || c.toRebuildQueue {
+		return 0, false
+	}
+	var rate float64
+	size := uint32(unsafe.Sizeof(rate))
+	if osstatus := _AudioQueueGetProperty(c.audioQueue, kAudioQueueDeviceProperty_SampleRate, unsafe.Pointer(&rate), &size); osstatus != noErr {
+		return 0, false
+	}
+	if rate <= 0 {
+		return 0, false
+	}
+	return int(math.Round(rate)), true
 }
 
 // Close ends loop, and then disposes the AudioQueue, which frees its buffers.

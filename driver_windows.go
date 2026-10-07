@@ -102,6 +102,18 @@ func (c *context) Resume() error {
 	return nil
 }
 
+func (c *context) DeviceSampleRate() (int, bool) {
+	select {
+	case <-c.ready:
+	default:
+		return 0, false
+	}
+	if c.wasapiContext != nil {
+		return c.wasapiContext.DeviceSampleRate()
+	}
+	return 0, false
+}
+
 func (c *context) Close() error {
 	<-c.ready
 	if c.wasapiContext != nil {

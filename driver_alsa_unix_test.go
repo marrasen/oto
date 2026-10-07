@@ -33,6 +33,9 @@ func TestALSACloseAndOpen(t *testing.T) {
 			m.Close()
 			t.Skipf("no ALSA device: %v", err)
 		}
+		if rate, ok := c.DeviceSampleRate(); !ok || rate <= 0 {
+			t.Errorf("DeviceSampleRate() = %d, %t; want a rate above zero, true", rate, ok)
+		}
 
 		// Play 100 ms of silence.
 		p := m.NewPlayer(bytes.NewReader(make([]byte, sampleRate/10*2*4)))

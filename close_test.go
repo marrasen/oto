@@ -171,12 +171,18 @@ func TestCloseAndNewContext(t *testing.T) {
 	if err := old.Resume(); err != nil {
 		t.Error(err)
 	}
+	if rate, ok := old.DeviceSampleRate(); ok || rate != 0 {
+		t.Errorf("DeviceSampleRate of a closed context: got %d, %t; want 0, false", rate, ok)
+	}
 
 	// The goroutines of a context end when it is closed.
 	goroutines := runtime.NumGoroutine()
 
 	ctx := newTestContext(t, otherSampleRate, 50*time.Millisecond)
 	playSilence(t, ctx, otherSampleRate, 100*time.Millisecond)
+	if rate, ok := ctx.DeviceSampleRate(); ok {
+		t.Logf("a context at %d Hz plays to a device at %d Hz", otherSampleRate, rate)
+	}
 	if err := ctx.Close(); err != nil {
 		t.Fatal(err)
 	}

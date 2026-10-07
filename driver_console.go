@@ -76,3 +76,7 @@ func (c *context) Err() error {
 func (c *context) Close() error {
 	return ErrCloseUnsupported
 }
+
+func (c *context) DeviceSampleRate() (int, bool) {
+	return 0, false
+}

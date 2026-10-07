@@ -48,6 +48,16 @@ func TestEmptyPlayer(t *testing.T) {
 	}
 }
 
+func TestDeviceSampleRate(t *testing.T) {
+	rate, ok := theContext.DeviceSampleRate()
+	if ok && rate <= 0 {
+		t.Errorf("DeviceSampleRate() = %d, true; want a rate above zero", rate)
+	}
+	if !ok && rate != 0 {
+		t.Errorf("DeviceSampleRate() = %d, false; want zero with false", rate)
+	}
+}
+
 // Issue #258
 func TestSetBufferSize(t *testing.T) {
 	for range 10 {
