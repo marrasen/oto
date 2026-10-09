@@ -18,6 +18,7 @@
 #include "oboe_oboe_Oboe_android.h"
 
 #include <android/api-level.h>
+#include <android/log.h>
 
 #include <algorithm>
 #include <atomic>
@@ -536,6 +537,7 @@ constexpr std::chrono::milliseconds kDelayEvery{100};
 // ForgetDelayLocked forgets the delay measured, as the stream it was measured
 // on is dropped, paused or replaced.
 void Stream::ForgetDelayLocked() {
+  __android_log_print(ANDROID_LOG_INFO, "otodelay", "forget");
   std::lock_guard<std::mutex> lock{delay_mutex_};
   delay_gen_++;
   delay_known_ = false;
@@ -563,7 +565,9 @@ void Stream::MeasureDelay() {
   for (int i = 0; i < 3; i++) {
     int64_t read = fifo_->getReadCounter();
     double ms;
+    double raw = -1;
     if (auto result = stream->calculateLatencyMillis(); result) {
+      raw = result.value();
       // The next frame the stream takes is heard this long from now. It can
       // come out negative, as around an underrun.
       ms = std::max(0.0, result.value());
@@ -572,7 +576,19 @@ void Stream::MeasureDelay() {
       // estimate.
       ms = stream->getBufferSizeInFrames() * 1000.0 / sample_rate_;
     } else {
+      __android_log_print(ANDROID_LOG_INFO, "otodelay",
+                          "measure failed: %s", oboe::convertToText(result.error()));
       return;
+    }
+    {
+      // Diagnostics: odd measurements at once, and a summary now and then.
+      static int count = 0;
+      if (raw > 500 || raw < 0 || ++count % 50 == 0) {
+        __android_log_print(ANDROID_LOG_INFO, "otodelay",
+                            "measure: latency %.1f ms (raw %.1f), fifo %lld frames, burst %d, buffer %d",
+                            ms, raw, (long long)(fifo_->getWriteCounter() - read),
+                            stream->getFramesPerBurst(), stream->getBufferSizeInFrames());
+      }
     }
     auto now = std::chrono::steady_clock::now();
     if (fifo_->getReadCounter() != read) {
@@ -607,6 +623,19 @@ int64_t Stream::Delay() {
       delay_heard_at_ - std::chrono::steady_clock::now();
   int64_t frames = fifo_->getWriteCounter() - delay_written_ +
                    std::llround(until.count() * sample_rate_);
+  if (frames > 2 * sample_rate_) {
+    // Diagnostics: a delay over two seconds, once a second at most.
+    static std::chrono::steady_clock::time_point logged;
+    auto now = std::chrono::steady_clock::now();
+    if (now - logged > std::chrono::seconds(1)) {
+      logged = now;
+      __android_log_print(ANDROID_LOG_INFO, "otodelay",
+                          "delay %lld frames: written since %lld, until heard %.3f s",
+                          (long long)frames,
+                          (long long)(fifo_->getWriteCounter() - delay_written_),
+                          until.count());
+    }
+  }
   return std::max<int64_t>(frames, 0);
 }
 
