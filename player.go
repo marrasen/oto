@@ -79,6 +79,11 @@ func (p *Player) BufferedSize() int {
 	return p.player.BufferedSize()
 }
 
+// UnplayedSize returns the byte size of the data read from the source that is not heard yet.
+func (p *Player) UnplayedSize() int {
+	return p.player.UnplayedSize()
+}
+
 // Err returns an error that occurred while reading the source.
 // Reaching the end of the source (io.EOF) is not treated as an error.
 //

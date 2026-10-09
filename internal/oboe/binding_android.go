@@ -36,7 +36,10 @@ var (
 // returns.
 func Play(sampleRate int, channelCount int, readFunc func(buf []float32), errorFunc func(err error), bufferSizeInBytes int) error {
 	// Play can invoke the callbacks. Set the callbacks before Play.
-	theReadFunc = readFunc
+	//
+	// Reads are paced: after the device takes a large burst, reads made as
+	// fast as there is room would outrun the players' buffers.
+	theReadFunc = newPacer(readFunc, sampleRate, channelCount).Read
 	theErrorFunc = errorFunc
 	if msg := C.oto_oboe_Play(C.int(sampleRate), C.int(channelCount), C.int(bufferSizeInBytes)); msg != nil {
 		return fmt.Errorf("oboe: Play failed: %s", C.GoString(msg))
@@ -60,10 +63,10 @@ func Resume() error {
 	return nil
 }
 
-// Latency returns how many frames read from the read function are still to be
-// heard, and whether the device has said yet.
-func Latency() (int64, bool) {
-	n := int64(C.oto_oboe_Latency())
+// Delay returns how many of the frames read with the read function are not
+// heard yet, and whether the device reports it.
+func Delay() (int64, bool) {
+	n := int64(C.oto_oboe_Delay())
 	return n, n >= 0
 }
 

@@ -38,14 +38,14 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		mux:        mux.New(sampleRate, channelCount, format),
 		sampleRate: sampleRate,
 	}
+	c.mux.SetDelayFunc(oboe.Delay)
 	go func() {
 		c.m.Lock()
 		defer c.m.Unlock()
 
 		// Reads are paced: the device can take a large burst at once, and reads
 		// made as fast as there is room would outrun the players' buffers.
-		pacer := mux.NewPacer(c.mux)
-		if err := oboe.Play(sampleRate, channelCount, pacer.ReadFloat32s, c.err.Join, bufferSizeInBytes); err != nil {
+		if err := oboe.Play(sampleRate, channelCount, c.mux.ReadFloat32s, c.err.Join, bufferSizeInBytes); err != nil {
 			c.err.Join(err)
 			return
 		}
@@ -67,11 +67,7 @@ func (c *context) Resume() error {
 }
 
 func (c *context) outputLatency() (time.Duration, bool) {
-	n, ok := oboe.Latency()
-	if !ok {
-		return 0, false
-	}
-	return time.Duration(n) * time.Second / time.Duration(c.sampleRate), true
+	return 0, false
 }
 
 func (c *context) Err() error {

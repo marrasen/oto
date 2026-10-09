@@ -65,7 +65,28 @@ type Mux struct {
 
 	// loopDone is closed when loop returns.
 	loopDone chan struct{}
+
+	mixed atomic.Int64
+	delay func() (int64, bool)
 }
+
+const maxSentSpans = 256
+
+func (m *Mux) SetDelayFunc(f func() (int64, bool)) { m.delay = f }
+
+func (m *Mux) heard() (int64, bool) {
+	if m.delay == nil {
+		return 0, false
+	}
+	mixed := m.mixed.Load()
+	d, ok := m.delay()
+	if !ok {
+		return 0, false
+	}
+	return mixed - max(d, 0)*int64(m.channelCount), true
+}
+
+type sentSpan struct{ start, end int64 }
 
 // New creates a new Mux.
 func New(sampleRate int, channelCount int, format Format) *Mux {
@@ -209,9 +230,11 @@ func (m *Mux) ReadFloat32s(buf []float32) {
 	for i := range buf {
 		buf[i] = 0
 	}
+	start := m.mixed.Load()
 	for _, p := range players {
-		p.readBufferAndAdd(buf)
+		p.readBufferAndAdd(buf, start)
 	}
+	m.mixed.Add(int64(len(buf)))
 	m.signal()
 }
 
@@ -238,6 +261,8 @@ const (
 )
 
 type playerImpl struct {
+	sent []sentSpan
+
 	mux        *Mux
 	src        io.Reader
 	prevVolume float64
@@ -495,6 +520,39 @@ func (p *Player) BufferedSize() int {
 	return p.p.BufferedSize()
 }
 
+func (p *Player) UnplayedSize() int { return p.p.UnplayedSize() }
+
+func (p *playerImpl) UnplayedSize() int {
+	p.m.Lock()
+	defer p.m.Unlock()
+	n := len(p.buf)
+	heard, ok := p.mux.heard()
+	if !ok {
+		p.sent = p.sent[:0]
+		return n
+	}
+	i := 0
+	for i < len(p.sent) && p.sent[i].end <= heard {
+		i++
+	}
+	p.sent = append(p.sent[:0], p.sent[i:]...)
+	for _, sp := range p.sent {
+		n += int(sp.end-max(sp.start, heard)) * p.mux.format.ByteLength()
+	}
+	return n
+}
+
+func (p *playerImpl) recordSent(start, end int64) {
+	if last := len(p.sent) - 1; last >= 0 && p.sent[last].end == start {
+		p.sent[last].end = end
+		return
+	}
+	if len(p.sent) == maxSentSpans {
+		p.sent = append(p.sent[:0], p.sent[1:]...)
+	}
+	p.sent = append(p.sent, sentSpan{start: start, end: end})
+}
+
 func (p *playerImpl) BufferedSize() int {
 	p.m.Lock()
 	defer p.m.Unlock()
@@ -524,7 +582,7 @@ func (p *playerImpl) closeImpl() error {
 	return p.err
 }
 
-func (p *playerImpl) readBufferAndAdd(buf []float32) int {
+func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -580,6 +638,10 @@ func (p *playerImpl) readBufferAndAdd(buf []float32) int {
 	}
 
 	p.prevVolume = p.volume
+
+	if n > 0 {
+		p.recordSent(start, start+int64(n))
+	}
 
 	copy(p.buf, p.buf[n*bitDepthInBytes:])
 	p.buf = p.buf[:len(p.buf)-n*bitDepthInBytes]
