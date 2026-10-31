@@ -95,9 +95,20 @@ type context struct {
 	audioQueue      _AudioQueueRef
 	unqueuedBuffers []_AudioQueueBufferRef
 
-	sampleRate           int
-	channelCount         int
+	sampleRate   int
+	channelCount int
+
+	// askedBufferSizeInBytes is the size of the queue the context was asked
+	// for, or 0 for the default.
+	askedBufferSizeInBytes int
+
+	// oneBufferSizeInBytes is the size of each of the queue's buffers, as
+	// fitDevice fits it to the output device.
 	oneBufferSizeInBytes int
+
+	// latency is how long a frame the queue takes is heard after, in
+	// nanoseconds, or 0 where the device reports nothing.
+	latency atomic.Int64
 
 	cond *sync.Cond
 
@@ -143,31 +154,15 @@ type context struct {
 var theContext *context
 
 func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
-	// defaultOneBufferSizeInBytes is the default buffer size in bytes.
-	//
-	// 12288 seems necessary at least on iPod touch (7th) and MacBook Pro 2020.
-	// With 48000[Hz] stereo, the maximum delay is (12288*4[buffers] / 4 / 2)[samples] / 48000 [Hz] = 100[ms].
-	// '4' is float32 size in bytes. '2' is a number of channels for stereo.
-	const defaultOneBufferSizeInBytes = 12288
-
-	var oneBufferSizeInBytes int
-	if bufferSizeInBytes != 0 {
-		oneBufferSizeInBytes = bufferSizeInBytes / bufferCount
-	} else {
-		oneBufferSizeInBytes = defaultOneBufferSizeInBytes
-	}
-	bytesPerSample := channelCount * 4
-	oneBufferSizeInBytes = oneBufferSizeInBytes / bytesPerSample * bytesPerSample
-
 	ready := make(chan struct{})
 
 	c := &context{
-		cond:                 sync.NewCond(&sync.Mutex{}),
-		mux:                  mux.New(sampleRate, channelCount, format),
-		sampleRate:           sampleRate,
-		channelCount:         channelCount,
-		oneBufferSizeInBytes: oneBufferSizeInBytes,
-		loopDone:             make(chan struct{}),
+		cond:                   sync.NewCond(&sync.Mutex{}),
+		mux:                    mux.New(sampleRate, channelCount, format),
+		sampleRate:             sampleRate,
+		channelCount:           channelCount,
+		askedBufferSizeInBytes: bufferSizeInBytes,
+		loopDone:               make(chan struct{}),
 	}
 	theContext = c
 
@@ -181,6 +176,7 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
+		c.fitDevice()
 		q, bs, err := newAudioQueue(c.sampleRate, c.channelCount, c.oneBufferSizeInBytes)
 		if err != nil {
 			c.err.Join(err)
@@ -190,6 +186,7 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		c.initialize(q, bs)
 
 		setupSessionNotifications()
+		watchOutputDevice()
 
 		close(ready)
 
@@ -197,6 +194,45 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 	}()
 
 	return c, ready, nil
+}
+
+// fitDevice sizes the queue's buffers, and the output device's buffer to
+// match.
+//
+// Where the queue's size was asked for, the device is asked to take half of
+// it at a time, so the queue holds two of the device's buffers: one it plays,
+// and one filled meanwhile. A device that takes more at a time than asked,
+// as one that refuses so small a buffer, gets buffers large enough to hold
+// two of its own all the same. AudioQueue goes silent where the queue holds
+// less than one of the device's buffers.
+//
+// The caller must hold c.cond.L, or be the only one using c.
+func (c *context) fitDevice() {
+	// defaultOneBufferSizeInBytes is the default buffer size in bytes.
+	//
+	// 12288 seems necessary at least on iPod touch (7th) and MacBook Pro 2020.
+	// With 48000[Hz] stereo, the maximum delay is (12288*4[buffers] / 4 / 2)[samples] / 48000 [Hz] = 100[ms].
+	// '4' is float32 size in bytes. '2' is a number of channels for stereo.
+	const defaultOneBufferSizeInBytes = 12288
+
+	bytesPerFrame := c.channelCount * float32SizeInBytes
+	one := defaultOneBufferSizeInBytes
+	var ask int
+	if c.askedBufferSizeInBytes != 0 {
+		one = c.askedBufferSizeInBytes / bufferCount
+		ask = c.askedBufferSizeInBytes / bytesPerFrame / 2
+	}
+	one = one / bytesPerFrame * bytesPerFrame
+
+	var latency time.Duration
+	if frames, held, ok := fitOutputDevice(ask, c.sampleRate); ok {
+		// Each buffer holds half the device's: bufferCount of them hold two.
+		one = max(one, (frames+1)/2*bytesPerFrame)
+		queued := bufferCount * one / bytesPerFrame
+		latency = time.Duration(queued+frames)*time.Second/time.Duration(c.sampleRate) + held
+	}
+	c.oneBufferSizeInBytes = one
+	c.latency.Store(int64(latency))
 }
 
 // initialize sets the freshly created AudioQueue and attempts the first start unless
@@ -245,16 +281,18 @@ func (c *context) idle() bool {
 }
 
 func (c *context) loop() {
-	buf32 := make([]float32, c.oneBufferSizeInBytes/4)
+	var buf32 []float32
 	for {
 		if !c.wait() {
 			return
 		}
-		c.step(buf32)
+		c.step(&buf32)
 	}
 }
 
-func (c *context) step(buf32 []float32) {
+// step does what idle says is to do. buf32 holds a buffer's samples, and
+// grows as fitDevice grows the buffers.
+func (c *context) step(buf32 *[]float32) {
 	c.cond.L.Lock()
 	defer c.cond.L.Unlock()
 
@@ -299,8 +337,13 @@ func (c *context) step(buf32 []float32) {
 	copy(c.unqueuedBuffers, c.unqueuedBuffers[1:])
 	c.unqueuedBuffers = c.unqueuedBuffers[:len(c.unqueuedBuffers)-1]
 
-	c.mux.ReadFloat32s(buf32)
-	copy(unsafe.Slice((*float32)(buf.mAudioData), buf.mAudioDataByteSize/float32SizeInBytes), buf32)
+	samples := unsafe.Slice((*float32)(buf.mAudioData), buf.mAudioDataByteSize/float32SizeInBytes)
+	if cap(*buf32) < len(samples) {
+		*buf32 = make([]float32, len(samples))
+	}
+	*buf32 = (*buf32)[:len(samples)]
+	c.mux.ReadFloat32s(*buf32)
+	copy(samples, *buf32)
 
 	if osstatus := _AudioQueueEnqueueBuffer(c.audioQueue, buf, 0, nil); osstatus != noErr {
 		if osstatus == kAudioQueueErr_QueueInvalidated {
@@ -483,6 +526,7 @@ func (c *context) rebuildAudioQueue() error {
 	}
 	c.unqueuedBuffers = nil
 
+	c.fitDevice()
 	q, bs, err := newAudioQueue(c.sampleRate, c.channelCount, c.oneBufferSizeInBytes)
 	if err != nil {
 		return fmt.Errorf("oto: rebuilding AudioQueue failed: %w", err)
@@ -494,6 +538,13 @@ func (c *context) rebuildAudioQueue() error {
 
 func (c *context) Err() error {
 	return c.err.Load()
+}
+
+// outputLatency returns how long a frame the queue takes is heard after,
+// as the output device reports it, and whether it does.
+func (c *context) outputLatency() (time.Duration, bool) {
+	d := time.Duration(c.latency.Load())
+	return d, d > 0
 }
 
 // DeviceSampleRate asks the AudioQueue for the sample rate of its output device.

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !android
+//go:build !android && !darwin
 
 package oto
 
@@ -24,7 +24,7 @@ import "time"
 // Android includes a Bluetooth headset's own delay where the headset reports
 // it. It leaves out what each player buffers: see Player.BufferedSize.
 //
-// Only Android reports it so far; elsewhere it returns false.
+// Only Android and macOS report it so far; elsewhere it returns false.
 //
 // OutputLatency is concurrent-safe.
 func (c *Context) OutputLatency() (time.Duration, bool) {
