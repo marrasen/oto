@@ -17,8 +17,10 @@
 package oto
 
 import (
+	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -39,6 +41,9 @@ const (
 	kAudioDevicePropertyNominalSampleRate    = 0x6e737274 // 'nsrt'
 	kAudioDevicePropertyLatency              = 0x6c746e63 // 'ltnc'
 	kAudioDevicePropertySafetyOffset         = 0x73616674 // 'saft'
+	kAudioDevicePropertyStreams              = 0x73746d23 // 'stm#'
+
+	kAudioStreamPropertyLatency = 0x6c746e63 // 'ltnc'
 )
 
 type _AudioObjectPropertyAddress struct {
@@ -52,12 +57,11 @@ type _AudioValueRange struct {
 	mMaximum float64
 }
 
-type _AudioObjectPropertyListenerProc func(inObjectID uint32, inNumberAddresses uint32, inAddresses unsafe.Pointer, inClientData unsafe.Pointer) int32
-
 var (
-	_AudioObjectGetPropertyData     func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inQualifierDataSize uint32, inQualifierData unsafe.Pointer, ioDataSize *uint32, outData unsafe.Pointer) int32
-	_AudioObjectSetPropertyData     func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inQualifierDataSize uint32, inQualifierData unsafe.Pointer, inDataSize uint32, inData unsafe.Pointer) int32
-	_AudioObjectAddPropertyListener func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inListener _AudioObjectPropertyListenerProc, inClientData unsafe.Pointer) int32
+	_AudioObjectGetPropertyData        func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inQualifierDataSize uint32, inQualifierData unsafe.Pointer, ioDataSize *uint32, outData unsafe.Pointer) int32
+	_AudioObjectSetPropertyData        func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inQualifierDataSize uint32, inQualifierData unsafe.Pointer, inDataSize uint32, inData unsafe.Pointer) int32
+	_AudioObjectAddPropertyListener    func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inListener uintptr, inClientData unsafe.Pointer) int32
+	_AudioObjectRemovePropertyListener func(inObjectID uint32, inAddress *_AudioObjectPropertyAddress, inListener uintptr, inClientData unsafe.Pointer) int32
 )
 
 var (
@@ -76,16 +80,18 @@ func initializeCoreAudio() bool {
 		purego.RegisterLibFunc(&_AudioObjectGetPropertyData, ca, "AudioObjectGetPropertyData")
 		purego.RegisterLibFunc(&_AudioObjectSetPropertyData, ca, "AudioObjectSetPropertyData")
 		purego.RegisterLibFunc(&_AudioObjectAddPropertyListener, ca, "AudioObjectAddPropertyListener")
+		purego.RegisterLibFunc(&_AudioObjectRemovePropertyListener, ca, "AudioObjectRemovePropertyListener")
 		coreAudioOK = true
 	})
 	return coreAudioOK
 }
 
-// getProperty reads the property of object id at selector and scope into out.
-func getProperty[T any](id uint32, selector, scope uint32, out *T) bool {
+// getProperty reads the property of object id at selector and scope into out,
+// and returns the OSStatus.
+func getProperty[T any](id uint32, selector, scope uint32, out *T) int32 {
 	addr := _AudioObjectPropertyAddress{mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain}
 	size := uint32(unsafe.Sizeof(*out))
-	return _AudioObjectGetPropertyData(id, &addr, 0, nil, &size, unsafe.Pointer(out)) == noErr
+	return _AudioObjectGetPropertyData(id, &addr, 0, nil, &size, unsafe.Pointer(out))
 }
 
 // fitOutputDevice asks the default output device, which an AudioQueue plays
@@ -94,64 +100,100 @@ func getProperty[T any](id uint32, selector, scope uint32, out *T) bool {
 // other applications playing to the same device keep theirs.
 //
 // It returns how many frames, at sampleRate, the device then takes at a
-// time, and how long it takes to play a frame once it has taken it.
-func fitOutputDevice(frames int, sampleRate int) (int, time.Duration, bool) {
+// time, how long it takes to play a frame once it has taken it, and whether
+// the device reports that.
+func fitOutputDevice(frames int, sampleRate int) (int, time.Duration, bool, error) {
 	if !initializeCoreAudio() {
-		return 0, 0, false
+		return 0, 0, false, fmt.Errorf("oto: loading CoreAudio failed")
 	}
 	var dev uint32
-	if !getProperty(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, &dev) || dev == 0 {
-		return 0, 0, false
+	if osstatus := getProperty(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, &dev); osstatus != noErr {
+		return 0, 0, false, fmt.Errorf("oto: reading the default output device failed: %d", osstatus)
+	}
+	if dev == 0 {
+		return 0, 0, false, fmt.Errorf("oto: there is no default output device")
 	}
 	var rate float64
-	if !getProperty(dev, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, &rate) || rate <= 0 {
-		return 0, 0, false
+	if osstatus := getProperty(dev, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, &rate); osstatus != noErr {
+		return 0, 0, false, fmt.Errorf("oto: reading the output device's sample rate failed: %d", osstatus)
+	}
+	if rate <= 0 {
+		return 0, 0, false, fmt.Errorf("oto: the output device's sample rate is %v", rate)
 	}
 
+	var setStatus int32 = noErr
 	if frames > 0 {
 		// The device counts its buffer at its own rate.
 		want := float64(frames) * rate / float64(sampleRate)
 		var r _AudioValueRange
-		if getProperty(dev, kAudioDevicePropertyBufferFrameSizeRange, kAudioObjectPropertyScopeGlobal, &r) {
+		if getProperty(dev, kAudioDevicePropertyBufferFrameSizeRange, kAudioObjectPropertyScopeGlobal, &r) == noErr {
 			want = min(max(want, r.mMinimum), r.mMaximum)
 		}
 		size := uint32(math.Ceil(want))
 		addr := _AudioObjectPropertyAddress{mSelector: kAudioDevicePropertyBufferFrameSize, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain}
 		// A device that refuses keeps the size it has, which is read below.
-		_ = _AudioObjectSetPropertyData(dev, &addr, 0, nil, uint32(unsafe.Sizeof(size)), unsafe.Pointer(&size))
+		setStatus = _AudioObjectSetPropertyData(dev, &addr, 0, nil, uint32(unsafe.Sizeof(size)), unsafe.Pointer(&size))
 	}
 
 	var size uint32
-	if !getProperty(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, &size) || size == 0 {
-		return 0, 0, false
+	if osstatus := getProperty(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, &size); osstatus != noErr || size == 0 {
+		return 0, 0, false, fmt.Errorf("oto: reading the output device's buffer size failed: %d (setting it: %d)", osstatus, setStatus)
 	}
-	var latency, safety uint32
-	_ = getProperty(dev, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, &latency)
-	_ = getProperty(dev, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, &safety)
-
 	ioFrames := int(math.Ceil(float64(size) * float64(sampleRate) / rate))
-	held := time.Duration(float64(latency+safety) * float64(time.Second) / rate)
-	return ioFrames, held, true
+
+	var latency, safety, stream, streamLatency uint32
+	if getProperty(dev, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, &latency) != noErr ||
+		getProperty(dev, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, &safety) != noErr ||
+		getProperty(dev, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, &stream) != noErr || stream == 0 ||
+		getProperty(stream, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, &streamLatency) != noErr {
+		return ioFrames, 0, false, nil
+	}
+	held := time.Duration(float64(latency+safety+streamLatency) * float64(time.Second) / rate)
+	return ioFrames, held, true, nil
 }
 
-var watchOutputDeviceOnce sync.Once
+var defaultOutputDeviceAddress = _AudioObjectPropertyAddress{mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain}
 
-// watchOutputDevice rebuilds the AudioQueue as the default output device
-// changes, so the queue is fitted to the device it plays to next: that
-// device takes its own buffer size from this process, which may be larger
-// than the queue holds.
-func watchOutputDevice() {
-	watchOutputDeviceOnce.Do(func() {
-		if !initializeCoreAudio() {
-			return
-		}
-		addr := _AudioObjectPropertyAddress{mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain}
-		_ = _AudioObjectAddPropertyListener(kAudioObjectSystemObject, &addr, outputDeviceChanged, nil)
+var (
+	outputDeviceListenerOnce sync.Once
+	outputDeviceListener     uintptr
+
+	// outputDeviceContext is the context outputDeviceChanged rebuilds, or nil.
+	outputDeviceContext atomic.Pointer[context]
+)
+
+// watchOutputDevice rebuilds c's AudioQueue as the default output device
+// changes, so the queue is fitted to the device it plays to next.
+func watchOutputDevice(c *context) error {
+	if !initializeCoreAudio() {
+		return fmt.Errorf("oto: loading CoreAudio failed")
+	}
+	outputDeviceListenerOnce.Do(func() {
+		outputDeviceListener = purego.NewCallback(outputDeviceChanged)
 	})
+	outputDeviceContext.Store(c)
+	addr := defaultOutputDeviceAddress
+	if osstatus := _AudioObjectAddPropertyListener(kAudioObjectSystemObject, &addr, outputDeviceListener, nil); osstatus != noErr {
+		outputDeviceContext.CompareAndSwap(c, nil)
+		return fmt.Errorf("oto: AudioObjectAddPropertyListener failed: %d", osstatus)
+	}
+	return nil
+}
+
+// unwatchOutputDevice stops what watchOutputDevice started for c.
+func unwatchOutputDevice(c *context) error {
+	if !outputDeviceContext.CompareAndSwap(c, nil) {
+		return nil
+	}
+	addr := defaultOutputDeviceAddress
+	if osstatus := _AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &addr, outputDeviceListener, nil); osstatus != noErr {
+		return fmt.Errorf("oto: AudioObjectRemovePropertyListener failed: %d", osstatus)
+	}
+	return nil
 }
 
 func outputDeviceChanged(inObjectID uint32, inNumberAddresses uint32, inAddresses unsafe.Pointer, inClientData unsafe.Pointer) int32 {
-	if c := theContext; c != nil {
+	if c := outputDeviceContext.Load(); c != nil {
 		c.restartFromNotification(true)
 	}
 	return noErr

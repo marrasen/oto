@@ -16,11 +16,14 @@ package oto
 
 import "time"
 
-// fitOutputDevice reports nothing on iOS, where AVAudioSession sets the
+// fitOutputDevice reports 0 frames on iOS, where AVAudioSession sets the
 // device's buffer for the whole application.
-func fitOutputDevice(frames int, sampleRate int) (int, time.Duration, bool) {
-	return 0, 0, false
+func fitOutputDevice(frames int, sampleRate int) (int, time.Duration, bool, error) {
+	return 0, 0, false, nil
 }
 
 // watchOutputDevice does nothing on iOS.
-func watchOutputDevice() {}
+func watchOutputDevice(c *context) error { return nil }
+
+// unwatchOutputDevice does nothing on iOS.
+func unwatchOutputDevice(c *context) error { return nil }

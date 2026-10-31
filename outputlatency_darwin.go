@@ -20,7 +20,8 @@ import "time"
 // players takes to be heard, as the device last reported it, and whether it
 // has. It counts what the context queues and what the device holds: on
 // macOS, the AudioQueue's buffers, the output device's buffer, and the
-// device's own latency and safety offset. iOS reports none so far.
+// device's own latency, safety offset and stream latency. iOS reports none
+// so far.
 // It leaves out what each player buffers: see Player.BufferedSize.
 //
 // OutputLatency is concurrent-safe.

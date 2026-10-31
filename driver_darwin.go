@@ -15,6 +15,7 @@
 package oto
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -176,7 +177,16 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		c.fitDevice()
+		if err := watchOutputDevice(c); err != nil {
+			c.err.Join(err)
+			close(ready)
+			return
+		}
+		if err := c.fitDevice(); err != nil {
+			c.err.Join(err)
+			close(ready)
+			return
+		}
 		q, bs, err := newAudioQueue(c.sampleRate, c.channelCount, c.oneBufferSizeInBytes)
 		if err != nil {
 			c.err.Join(err)
@@ -186,7 +196,6 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		c.initialize(q, bs)
 
 		setupSessionNotifications()
-		watchOutputDevice()
 
 		close(ready)
 
@@ -204,10 +213,11 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 // and one filled meanwhile. A device that takes more at a time than asked,
 // as one that refuses so small a buffer, gets buffers large enough to hold
 // two of its own all the same. AudioQueue goes silent where the queue holds
-// less than one of the device's buffers.
+// less than one of the device's buffers. It returns an error where the output
+// device cannot be read.
 //
 // The caller must hold c.cond.L, or be the only one using c.
-func (c *context) fitDevice() {
+func (c *context) fitDevice() error {
 	// defaultOneBufferSizeInBytes is the default buffer size in bytes.
 	//
 	// 12288 seems necessary at least on iPod touch (7th) and MacBook Pro 2020.
@@ -224,15 +234,22 @@ func (c *context) fitDevice() {
 	}
 	one = one / bytesPerFrame * bytesPerFrame
 
+	frames, held, heldOK, err := fitOutputDevice(ask, c.sampleRate)
+	if err != nil {
+		return err
+	}
 	var latency time.Duration
-	if frames, held, ok := fitOutputDevice(ask, c.sampleRate); ok {
+	if frames > 0 {
 		// Each buffer holds half the device's: bufferCount of them hold two.
 		one = max(one, (frames+1)/2*bytesPerFrame)
-		queued := bufferCount * one / bytesPerFrame
-		latency = time.Duration(queued+frames)*time.Second/time.Duration(c.sampleRate) + held
+		if heldOK {
+			queued := bufferCount * one / bytesPerFrame
+			latency = time.Duration(queued+frames)*time.Second/time.Duration(c.sampleRate) + held
+		}
 	}
 	c.oneBufferSizeInBytes = one
 	c.latency.Store(int64(latency))
+	return nil
 }
 
 // initialize sets the freshly created AudioQueue and attempts the first start unless
@@ -526,7 +543,9 @@ func (c *context) rebuildAudioQueue() error {
 	}
 	c.unqueuedBuffers = nil
 
-	c.fitDevice()
+	if err := c.fitDevice(); err != nil {
+		return err
+	}
 	q, bs, err := newAudioQueue(c.sampleRate, c.channelCount, c.oneBufferSizeInBytes)
 	if err != nil {
 		return fmt.Errorf("oto: rebuilding AudioQueue failed: %w", err)
@@ -575,6 +594,7 @@ func (c *context) Close() error {
 	c.cond.L.Unlock()
 
 	<-c.loopDone
+	err := unwatchOutputDevice(c)
 
 	// The queue is disposed without holding the lock, as its callback, render,
 	// takes the lock. render drops the buffers of a queue that is not
@@ -586,12 +606,12 @@ func (c *context) Close() error {
 	c.cond.L.Unlock()
 
 	if q == 0 {
-		return nil
+		return err
 	}
 	if osstatus := _AudioQueueDispose(q, true); osstatus != noErr && osstatus != kAudioQueueErr_QueueInvalidated {
-		return fmt.Errorf("oto: AudioQueueDispose failed: %d", osstatus)
+		return errors.Join(err, fmt.Errorf("oto: AudioQueueDispose failed: %d", osstatus))
 	}
-	return nil
+	return err
 }
 
 func render(inUserData unsafe.Pointer, inAQ _AudioQueueRef, inBuffer _AudioQueueBufferRef) {
